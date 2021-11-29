@@ -24,6 +24,23 @@ def md5_file(filepath):
     return hash_md5.hexdigest()
 
 
+def is_covered(child, parent):
+    bool1 = child['left'] >= parent['left']
+    bool2 = child['top'] >= parent['top']
+    bool3 = child['left'] + child['width'] <= parent['left'] + parent['width']
+    bool4 = child['top'] + child['height'] <= parent['top'] + parent['height']
+    return bool1 and bool2 and bool3 and bool4
+
+
+def is_intersected(location1, location2):
+    # TODO wrong?
+    bool1 = location1['left'] <= location2['left'] + location2['width']
+    bool2 = location1['top'] >= location2['top'] + location2['height']
+    bool3 = location1['left'] + location1['width'] >= location2['left']
+    bool4 = location1['top'] + location1['height'] <= location2['top']
+    return bool1 and bool2 and bool3 and bool4
+
+
 def convert_tesseract_data(data):
     length = len(data['level'])
     level2key = {
@@ -109,12 +126,13 @@ if not os.path.exists(temp_dir):
         image_path = os.path.join(temp_dir, f"page-{index:04d}-stage-1.png")
         page.save(image_path)
 
-stage_1_files = sorted([
+page_files = sorted([
     filename for filename in os.listdir(temp_dir)
     if re.search("^page-\d+-stage-1\.png$", filename)
 ])
 
-for index, filename in enumerate(stage_1_files):
+document_data = []
+for index, filename in enumerate(page_files):
     image_path = os.path.join(temp_dir, filename)
     image = cv2.imread(image_path)
     data = pytesseract.image_to_data(image, output_type=Output.DICT)
@@ -127,48 +145,89 @@ for index, filename in enumerate(stage_1_files):
 
     data = convert_tesseract_data(data)
     assert len(data) == 1
-    for page in data:
-        page_num = page['num']
-        page_location = page['location']
-        for block in page['data']:
-            block_num = block['num']
-            block_location = block['location']
-            block_area = block_location['width'] * block_location['height']
-            block_word_area = 0
+    page = data[0]
+    page_location = page['location']
+
+    text_blocks = []
+    non_text_blocks = []
+    sorted_blocks = sorted(page['data'],
+                           key=lambda block: block['location']['width'] *
+                           block['location']['height'],
+                           reverse=True)
+    for block in sorted_blocks:
+        block_num = block['num']
+        block_location = block['location']
+        if any([
+                is_covered(block_location, non_text_block['location'])
+                for non_text_block in non_text_blocks
+        ]):
+            continue
+        block_area = block_location['width'] * block_location['height']
+        block_word_area = 0
+        for par in block['data']:
+            for line in par['data']:
+                for word in line['data']:
+                    word_location = word['location']
+                    if normal_word_height_limit[0] < word_location[
+                            'height'] < normal_word_height_limit[1]:
+                        cv2.rectangle(
+                            image,
+                            (word_location['left'], word_location['top']),
+                            (word_location['left'] + word_location['width'],
+                             word_location['top'] + word_location['height']),
+                            (0, 0, 0), 2)
+                        block_word_area += word_location[
+                            'width'] * word_location['height']
+
+        cv2.putText(image,
+                    f'B:{block_num},D:{(block_word_area/block_area):.2f}',
+                    (block_location['left'] - 300, block_location['top'] + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 2, cv2.LINE_AA)
+
+        def is_text_block():
+            return (block_word_area / block_area) > 0.4
+
+        overlay = image.copy()
+        cv2.rectangle(
+            overlay, (block_location['left'] - 20, block_location['top'] - 20),
+            (block_location['left'] + block_location['width'] + 20,
+             block_location['top'] + block_location['height'] + 20),
+            (0, 255, 0) if is_text_block() else (0, 0, 255), -1)
+        alpha = 0.1
+        image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+        if is_text_block():
+            words = {}
             for par in block['data']:
-                par_num = par['num']
-                par_location = par['location']
                 for line in par['data']:
                     for word in line['data']:
-                        word_location = word['location']
-                        if normal_word_height_limit[0] < word_location[
-                                'height'] < normal_word_height_limit[1]:
-                            cv2.rectangle(
-                                image,
-                                (word_location['left'], word_location['top']),
-                                (word_location['left'] +
-                                 word_location['width'], word_location['top'] +
-                                 word_location['height']), (0, 0, 0), 2)
-                            block_word_area += word_location[
-                                'width'] * word_location['height']
-
-            cv2.putText(image,
-                        f'B:{block_num},D:{(block_word_area/block_area):.2f}',
-                        (par_location['left'] - 300, par_location['top']),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 2,
-                        cv2.LINE_AA)
-
-            def is_text_block():
-                return (block_word_area / block_area) > 0.4
-
-            overlay = image.copy()
-            cv2.rectangle(
-                overlay,
-                (block_location['left'] - 20, block_location['top'] - 20),
-                (block_location['left'] + block_location['width'] + 20,
-                 block_location['top'] + block_location['height'] + 20),
-                (0, 255, 0) if is_text_block() else (0, 0, 255), -1)
-            alpha = 0.1
-            image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+                        words[par['num'], line['num'],
+                              word['num']] = (word['location'], word['data'])
+            words = dict(sorted(words.items())).values()
+            words = [{'location': x[0], 'text': x[1]} for x in words]
+            text_blocks.append({
+                **{k: block[k]
+                   for k in ['num', 'location']},
+                'data': words,
+                'is_text_block': True,
+            })
+        else:
+            non_text_blocks.append({
+                **{k: block[k]
+                   for k in ['num', 'location']},
+                'is_text_block': False,
+            })
 
     cv2.imwrite(os.path.join(temp_dir, f"page-{index:04d}-stage-2.png"), image)
+    page_data = sorted([*text_blocks, *non_text_blocks],
+                       key=lambda x: x['num'])
+    for block in page_data:
+        block['page_index'] = index
+        del block['num']
+    document_data.extend(page_data)
+    print(f'Finish stage 2 for {index+1} page')
+
+for block in document_data:
+    if block['is_text_block']:
+        pass
+    else:
+        print(block)
