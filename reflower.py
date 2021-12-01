@@ -6,10 +6,9 @@ from pytesseract import Output
 import cv2
 import hashlib
 from pdf2image import convert_from_path
-import re
+from PIL import Image
 import numpy as np
 from distutils.util import strtobool
-from fpdf import FPDF
 from itertools import chain
 from typesetter import Typesetter
 
@@ -18,28 +17,11 @@ def md5_string(string):
     return hashlib.md5(string.encode('utf-8')).hexdigest()
 
 
-def md5_file(filepath):
-    hash_md5 = hashlib.md5()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
-
-
 def is_covered(child, parent):
     bool1 = child['left'] >= parent['left']
     bool2 = child['top'] >= parent['top']
     bool3 = child['left'] + child['width'] <= parent['left'] + parent['width']
     bool4 = child['top'] + child['height'] <= parent['top'] + parent['height']
-    return bool1 and bool2 and bool3 and bool4
-
-
-def is_intersected(location1, location2):
-    # TODO wrong?
-    bool1 = location1['left'] <= location2['left'] + location2['width']
-    bool2 = location1['top'] >= location2['top'] + location2['height']
-    bool3 = location1['left'] + location1['width'] >= location2['left']
-    bool4 = location1['top'] + location1['height'] <= location2['top']
     return bool1 and bool2 and bool3 and bool4
 
 
@@ -115,32 +97,28 @@ parser.add_argument('--root_temp_dir', type=str, default='./temp')
 args = parser.parse_args()
 
 assert os.path.isfile(args.source), 'Source file not found'
-
-hash_value = md5_string(
-    md5_string(args.source) + md5_file(args.source) +
-    md5_string(str(args.dpi)))[:16]
-temp_dir = os.path.join(args.root_temp_dir, hash_value)
-print(f'Temp directory: {temp_dir}')
-if not os.path.exists(temp_dir):
-    Path(temp_dir).mkdir(parents=True)
-    pages = convert_from_path(args.source, dpi=args.dpi)
-    for index, page in enumerate(pages):
-        image_path = os.path.join(temp_dir, f"page-{index:04d}-stage-1.png")
-        page.save(image_path)
-
-page_files = sorted([
-    filename for filename in os.listdir(temp_dir)
-    if re.search("^page-\d+-stage-1\.png$", filename)
-])
-
-source_page_data = [
-    cv2.imread(os.path.join(temp_dir, filename)) for filename in page_files
+source_page_data_pillow = convert_from_path(args.source, dpi=args.dpi)
+source_page_data_opencv = [
+    cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR)
+    for page in source_page_data_pillow
 ]
+if args.debug:
+    hash_value = md5_string(str(args))[:16]
+    temp_dir = os.path.join(args.root_temp_dir, hash_value)
+    print(f'Temp directory: {temp_dir}')
+    stage_dir = os.path.join(temp_dir, 'stage-1')
+    Path(stage_dir).mkdir(parents=True, exist_ok=True)
+    for index, page in enumerate(source_page_data_opencv):
+        image_path = os.path.join(stage_dir, f"page-{index:04d}.png")
+        cv2.imwrite(image_path, page)
 
+block_proportion_threshold = (1 / 50, 8)
 document_data = []
-for index, image in enumerate(source_page_data):
-    image = image.copy()  # TODO
-    data = pytesseract.image_to_data(image, output_type=Output.DICT)
+for index in range(len(source_page_data_opencv)):
+    if args.debug:
+        image = source_page_data_opencv[index].copy()
+    data = pytesseract.image_to_data(source_page_data_pillow[index],
+                                     output_type=Output.DICT)
     word_heights = np.array([
         data['height'][i] for i in range(len(data['level']))
         if data['level'][i] == 5
@@ -167,6 +145,24 @@ for index, image in enumerate(source_page_data):
                 for non_text_block in non_text_blocks
         ]):
             continue
+
+        block_proportion = block_location['height'] / block_location['width']
+        if not (block_proportion_threshold[0] < block_proportion <
+                block_proportion_threshold[1]):
+            if args.debug:
+                print(f'Ignore block with proportion {block_proportion}')
+                overlay = image.copy()
+                cv2.rectangle(
+                    overlay,
+                    (block_location['left'] - 2, block_location['top'] - 2),
+                    (block_location['left'] + block_location['width'] + 2,
+                     block_location['top'] + block_location['height'] + 2),
+                    (255, 0, 0), -1)
+                alpha = 0.2
+                image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+
+            continue
+
         block_area = block_location['width'] * block_location['height']
         block_word_area = 0
         for par in block['data']:
@@ -175,31 +171,35 @@ for index, image in enumerate(source_page_data):
                     word_location = word['location']
                     if normal_word_height_limit[0] < word_location[
                             'height'] < normal_word_height_limit[1]:
-                        cv2.rectangle(
-                            image,
-                            (word_location['left'], word_location['top']),
-                            (word_location['left'] + word_location['width'],
-                             word_location['top'] + word_location['height']),
-                            (0, 0, 0), 2)
+                        if args.debug:
+                            cv2.rectangle(
+                                image,
+                                (word_location['left'], word_location['top']),
+                                (word_location['left'] +
+                                 word_location['width'], word_location['top'] +
+                                 word_location['height']), (0, 0, 0), 2)
                         block_word_area += word_location[
                             'width'] * word_location['height']
-
-        cv2.putText(image,
-                    f'B:{block_num},D:{(block_word_area/block_area):.2f}',
-                    (block_location['left'] - 300, block_location['top'] + 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 2, cv2.LINE_AA)
+        if args.debug:
+            cv2.putText(
+                image, f'B:{block_num},D:{(block_word_area/block_area):.2f}',
+                (block_location['left'] - 300, block_location['top'] + 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 2, cv2.LINE_AA)
 
         def is_text_block():
             return (block_word_area / block_area) > 0.4
 
-        overlay = image.copy()
-        cv2.rectangle(
-            overlay, (block_location['left'] - 20, block_location['top'] - 20),
-            (block_location['left'] + block_location['width'] + 20,
-             block_location['top'] + block_location['height'] + 20),
-            (0, 255, 0) if is_text_block() else (0, 0, 255), -1)
-        alpha = 0.1
-        image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+        if args.debug:
+            overlay = image.copy()
+            cv2.rectangle(
+                overlay,
+                (block_location['left'] - 2, block_location['top'] - 2),
+                (block_location['left'] + block_location['width'] + 2,
+                 block_location['top'] + block_location['height'] + 2),
+                (0, 255, 0) if is_text_block() else (0, 0, 255), -1)
+            alpha = 0.1
+            image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+
         if is_text_block():
             words = {}
             for par in block['data']:
@@ -216,7 +216,10 @@ for index, image in enumerate(source_page_data):
                         words[par['num'], line['num'],
                               word['num']] = (word['location'], word['data'])
             words = dict(sorted(words.items())).values()
-            words = [{'location': x[0], 'text': x[1]} for x in words]
+            words = [{
+                'location': x[0],
+                'text': x[1]
+            } for x in words if len(x[1].strip()) > 0]
             text_blocks.append({
                 **{k: block[k]
                    for k in ['num', 'location']},
@@ -230,7 +233,11 @@ for index, image in enumerate(source_page_data):
                 'is_text_block': False,
             })
 
-    cv2.imwrite(os.path.join(temp_dir, f"page-{index:04d}-stage-2.png"), image)
+    if args.debug:
+        stage_dir = os.path.join(temp_dir, 'stage-2')
+        Path(stage_dir).mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(os.path.join(stage_dir, f"page-{index:04d}.png"), image)
+
     page_data = sorted([*text_blocks, *non_text_blocks],
                        key=lambda x: x['num'])
     for block in page_data:
@@ -258,20 +265,24 @@ text_height = int(
                     [[x['location']['height'] for x in block['data']]
                      for block in document_data if block['is_text_block']])))))
 
-typesetter = Typesetter(*paper_size_pt, text_height, source_page_data)
+typesetter = Typesetter(*paper_size_pt, text_height, source_page_data_opencv)
 
 for block in document_data:
     typesetter.add_block(block)
 
-for index, page in enumerate(typesetter.export_pages()):
-    cv2.imwrite(os.path.join(temp_dir, f"page-{index:04d}-stage-3.png"), page)
+exported_pages_opencv = typesetter.export_pages()
+if args.debug:
+    stage_dir = os.path.join(temp_dir, 'stage-3')
+    Path(stage_dir).mkdir(parents=True, exist_ok=True)
+    for index, page in enumerate(exported_pages_opencv):
+        cv2.imwrite(os.path.join(stage_dir, f"page-{index:04d}.png"), page)
 
-page_files = sorted([
-    filename for filename in os.listdir(temp_dir)
-    if re.search("^page-\d+-stage-3\.png$", filename)
-])
-pdf = FPDF('P', 'mm', paper_size_mm)
-for filename in page_files:
-    pdf.add_page()
-    pdf.image(os.path.join(temp_dir, filename), 0, 0, *paper_size_mm)
-pdf.output("output.pdf", "F")
+exported_pages_pillow = [
+    Image.fromarray(cv2.cvtColor(page, cv2.COLOR_BGR2RGB))
+    for page in exported_pages_opencv
+]
+exported_pages_pillow[0].save(args.target,
+                              "PDF",
+                              resolution=args.dpi,
+                              save_all=True,
+                              append_images=exported_pages_pillow[1:])

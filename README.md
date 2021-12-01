@@ -1,8 +1,5 @@
+# Reflower
 
-
-
-
-
-
-
-TODO multithread
+## TODO
+- multithread
+- add invisible text layer

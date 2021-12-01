@@ -9,6 +9,8 @@ class Typesetter:
         self.text_height = text_height
         self.line_height = int(1.5 * text_height)
         self.word_space = int(0.4 * text_height)
+        self.dash_space = int(0.25 * text_height)
+        self.last_word_height = text_height
         self.source_page_data = source_page_data
         self.pages = []
         self.current_page = None
@@ -19,7 +21,6 @@ class Typesetter:
              page_height - int(0.5 * text_height))
         ]
         self.take_new_page()
-        self.last_word_height = text_height
 
     def add_block(self, block):
         if block['is_text_block']:
@@ -35,7 +36,7 @@ class Typesetter:
                         abs(self.last_word_height - new_size[1]) /
                         self.text_height) < 0.005:
                     break
-                self.take_new_line()
+                self.take_new_line(new_size[1])
                 if self.is_fittable(new_size):
                     break
                 self.take_new_page()
@@ -52,7 +53,12 @@ class Typesetter:
                     new_size[1],
                     word['location']['left']:word['location']['left'] +
                     new_size[0]]
-            self.current_curser[0] += new_size[0] + self.word_space
+
+            if word['text'].endswith('-'):
+                word_space = -self.dash_space
+            else:
+                word_space = self.word_space
+            self.current_curser[0] += new_size[0] + word_space
             self.last_word_height = new_size[1]
 
     def add_non_text_block(self, block):
@@ -66,6 +72,7 @@ class Typesetter:
         while True:
             if self.is_fittable(new_size):
                 break
+
             resized = True
             available_width = self.available_area[1][0] - self.available_area[
                 0][0]
@@ -77,8 +84,8 @@ class Typesetter:
                 new_size = (available_width,
                             int(new_size[1] / resize_factor_x))
             else:
-                new_size = (int(new_size[0] / resize_factor_y,
-                                available_height))
+                new_size = (int(new_size[0] / resize_factor_y),
+                            available_height)
 
             if self.is_fittable(new_size):
                 break
@@ -108,8 +115,12 @@ class Typesetter:
             (self.page_height, self.page_width, 3), np.uint8)
         self.current_curser = list(self.available_area[0])
 
-    def take_new_line(self):
-        coefficient = self.last_word_height / self.text_height
+    def take_new_line(self, current_word_height=None):
+        if current_word_height is None:
+            coefficient = self.last_word_height / self.text_height
+        else:
+            coefficient = max(current_word_height,
+                              self.last_word_height) / self.text_height
         line_height = int(self.line_height * coefficient)
         if self.current_curser[1] + line_height > self.available_area[1][1]:
             self.take_new_page()
