@@ -7,9 +7,11 @@ import cv2
 import hashlib
 from pdf2image import convert_from_path
 import re
-from time import time
-import ipdb  # TODO
 import numpy as np
+from distutils.util import strtobool
+from fpdf import FPDF
+from itertools import chain
+from typesetter import Typesetter
 
 
 def md5_string(string):
@@ -78,8 +80,8 @@ def convert_tesseract_data(data):
                     list(set(candidate_indexs) - set(found_indexs)),
                     level=level + 1,
                     **{
-                        level2key[l]: data[level2key[l]][index]
-                        for l in range(1, level + 1)
+                        level2key[x]: data[level2key[x]][index]
+                        for x in range(1, level + 1)
                     })
             else:
                 result_data = data['text'][index]
@@ -102,26 +104,26 @@ def convert_tesseract_data(data):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--source',
-                    type=str,
-                    default='./test/arxiv/2109.05236.pdf')
+parser.add_argument('--source', type=str, default='./test/example.pdf')
 parser.add_argument('--target', type=str, default='./output.pdf')
-parser.add_argument('--processing_dpi', type=int, default=400)
-parser.add_argument('--export_dpi', type=int, default=300)
+parser.add_argument('--dpi', type=int, default=300)
+parser.add_argument('--target_paper', type=str, default='pw3')
+parser.add_argument('--debug',
+                    type=lambda x: bool(strtobool(x)),
+                    default=False)
 parser.add_argument('--root_temp_dir', type=str, default='./temp')
 args = parser.parse_args()
 
-assert args.processing_dpi >= args.export_dpi, 'processing_dpi should be larger than export_dpi'
 assert os.path.isfile(args.source), 'Source file not found'
 
 hash_value = md5_string(
     md5_string(args.source) + md5_file(args.source) +
-    md5_string(str(args.processing_dpi)))[:16]
+    md5_string(str(args.dpi)))[:16]
 temp_dir = os.path.join(args.root_temp_dir, hash_value)
 print(f'Temp directory: {temp_dir}')
 if not os.path.exists(temp_dir):
     Path(temp_dir).mkdir(parents=True)
-    pages = convert_from_path(args.source, dpi=args.processing_dpi)
+    pages = convert_from_path(args.source, dpi=args.dpi)
     for index, page in enumerate(pages):
         image_path = os.path.join(temp_dir, f"page-{index:04d}-stage-1.png")
         page.save(image_path)
@@ -131,10 +133,13 @@ page_files = sorted([
     if re.search("^page-\d+-stage-1\.png$", filename)
 ])
 
+source_page_data = [
+    cv2.imread(os.path.join(temp_dir, filename)) for filename in page_files
+]
+
 document_data = []
-for index, filename in enumerate(page_files):
-    image_path = os.path.join(temp_dir, filename)
-    image = cv2.imread(image_path)
+for index, image in enumerate(source_page_data):
+    image = image.copy()  # TODO
     data = pytesseract.image_to_data(image, output_type=Output.DICT)
     word_heights = np.array([
         data['height'][i] for i in range(len(data['level']))
@@ -199,7 +204,15 @@ for index, filename in enumerate(page_files):
             words = {}
             for par in block['data']:
                 for line in par['data']:
+                    top_line = min(
+                        [word['location']['top'] for word in line['data']])
+                    bottom_line = max([
+                        word['location']['top'] + word['location']['height']
+                        for word in line['data']
+                    ])
                     for word in line['data']:
+                        word['location']['top'] = top_line
+                        word['location']['height'] = bottom_line - top_line
                         words[par['num'], line['num'],
                               word['num']] = (word['location'], word['data'])
             words = dict(sorted(words.items())).values()
@@ -224,10 +237,41 @@ for index, filename in enumerate(page_files):
         block['page_index'] = index
         del block['num']
     document_data.extend(page_data)
-    print(f'Finish stage 2 for {index+1} page')
+
+paper2size_mm = {
+    'a4': (210, 297),
+    'a5': (148, 210),
+    'pw3': (90.8, 122.6),
+}
+if args.target_paper in paper2size_mm:
+    paper_size_mm = paper2size_mm[args.target_paper]
+else:
+    paper_size_mm = list(map(float, args.target_paper.split('x')))
+# (width, height)
+paper_size_pt = tuple(map(lambda x: int(x / 25.4 * args.dpi), paper_size_mm))
+
+text_height = int(
+    np.median(
+        np.array(
+            list(
+                chain.from_iterable(
+                    [[x['location']['height'] for x in block['data']]
+                     for block in document_data if block['is_text_block']])))))
+
+typesetter = Typesetter(*paper_size_pt, text_height, source_page_data)
 
 for block in document_data:
-    if block['is_text_block']:
-        pass
-    else:
-        print(block)
+    typesetter.add_block(block)
+
+for index, page in enumerate(typesetter.export_pages()):
+    cv2.imwrite(os.path.join(temp_dir, f"page-{index:04d}-stage-3.png"), page)
+
+page_files = sorted([
+    filename for filename in os.listdir(temp_dir)
+    if re.search("^page-\d+-stage-3\.png$", filename)
+])
+pdf = FPDF('P', 'mm', paper_size_mm)
+for filename in page_files:
+    pdf.add_page()
+    pdf.image(os.path.join(temp_dir, filename), 0, 0, *paper_size_mm)
+pdf.output("output.pdf", "F")
