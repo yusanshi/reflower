@@ -11,6 +11,7 @@ import numpy as np
 from distutils.util import strtobool
 from itertools import chain
 from typesetter import Typesetter
+import layoutparser as lp
 
 
 def md5_string(string):
@@ -88,7 +89,7 @@ def convert_tesseract_data(data):
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=str, default='./test/example.pdf')
 parser.add_argument('--target', type=str, default='./output.pdf')
-parser.add_argument('--dpi', type=int, default=300)
+parser.add_argument('--dpi', type=int, default=400)
 parser.add_argument('--target_paper', type=str, default='pw3')
 parser.add_argument('--debug',
                     type=lambda x: bool(strtobool(x)),
@@ -112,138 +113,199 @@ if args.debug:
         image_path = os.path.join(stage_dir, f"page-{index:04d}.png")
         cv2.imwrite(image_path, page)
 
+color_map = {
+    'text': 'red',
+    'title': 'blue',
+    'list': 'green',
+    'table': 'purple',
+    'figure': 'pink',
+}
+
+# lp_model = lp.EfficientDetLayoutModel(
+#     "lp://efficientdet/PubLayNet/tf_efficientdet_d1")
+
+lp_model_general = lp.PaddleDetectionLayoutModel(
+    "lp://paddledetection/PubLayNet/ppyolov2_r50vd_dcn_365e")
+# lp_model = lp.Detectron2LayoutModel(
+#     # 'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
+#     'lp://PubLayNet/mask_rcnn_X_101_32x8d_FPN_3x/config')
+
+lp_model_table = lp.PaddleDetectionLayoutModel(
+    'lp://paddledetection/TableBank/ppyolov2_r50vd_dcn_365e')
+
+# formula
+lp_model_formula = lp.Detectron2LayoutModel(
+    'lp://MFD/faster_rcnn_R_50_FPN_3x/config')
+
+# table
+# lp_model = lp.Detectron2LayoutModel(
+#     config_path=
+#     'lp://TableBank/faster_rcnn_R_101_FPN_3x/config',  # In model catalog
+#     label_map={0: "Table"},  # In model`label_map`
+# )
+
 block_proportion_threshold = (1 / 50, 8)
 document_data = []
 for index in range(len(source_page_data_opencv)):
     if args.debug:
         image = source_page_data_opencv[index].copy()
-    data = pytesseract.image_to_data(source_page_data_pillow[index],
-                                     output_type=Output.DICT)
-    word_heights = np.array([
-        data['height'][i] for i in range(len(data['level']))
-        if data['level'][i] == 5
-    ])
-    normal_word_height = np.median(word_heights)
-    normal_word_height_limit = (normal_word_height / 3, normal_word_height * 3)
+    layout_formula = lp_model_formula.detect(source_page_data_pillow[index])
+    for x in layout_formula:
+        print('Formula:', x.score)
+    layout_table = lp_model_table.detect(source_page_data_pillow[index])
+    for x in layout_table:
+        print('Table:', x.score)
+    layout_general = lp_model_general.detect(source_page_data_pillow[index])
+    for x in layout_general:
+        print('General:', x.score)
+    print()
+    # If overlapped, then 1. keep the largest, or 2. ((min(x1), max(y1)), (max(x2),max(y2)))
+    # then reorder
+    # then for text block, for non-text block...
+    # TODO enlarge the block space if the border area is not occpuied by other blocks
+    # TODO pdf text to outlines, then copy the vector into new pdf instead of bitmap
+    lp.draw_box(
+        source_page_data_pillow[index],
+        # layout,
+        [
+            b for b in layout_general + layout_formula + layout_table
+            if b.score > 0.4
+        ],
+        show_element_id=True,
+        color_map=color_map,
+        id_font_size=40,
+        id_text_background_color='grey',
+        id_text_color='white',
+        box_width=3).show()
 
-    data = convert_tesseract_data(data)
-    assert len(data) == 1
-    page = data[0]
-    page_location = page['location']
+exit(0)
+# data = pytesseract.image_to_data(source_page_data_pillow[index],
+#                                  output_type=Output.DICT)
+# word_heights = np.array([
+#     data['height'][i] for i in range(len(data['level']))
+#     if data['level'][i] == 5
+# ])
+# normal_word_height = np.median(word_heights)
+# normal_word_height_limit = (normal_word_height / 3, normal_word_height * 3)
 
-    text_blocks = []
-    non_text_blocks = []
-    sorted_blocks = sorted(page['data'],
-                           key=lambda block: block['location']['width'] *
-                           block['location']['height'],
-                           reverse=True)
-    for block in sorted_blocks:
-        block_num = block['num']
-        block_location = block['location']
-        if any([
-                is_covered(block_location, non_text_block['location'])
-                for non_text_block in non_text_blocks
-        ]):
-            continue
+# data = convert_tesseract_data(data)
+# assert len(data) == 1
+# page = data[0]
+# page_location = page['location']
 
-        block_proportion = block_location['height'] / block_location['width']
-        if not (block_proportion_threshold[0] < block_proportion <
-                block_proportion_threshold[1]):
-            if args.debug:
-                print(f'Ignore block with proportion {block_proportion}')
-                overlay = image.copy()
-                cv2.rectangle(
-                    overlay,
-                    (block_location['left'] - 2, block_location['top'] - 2),
-                    (block_location['left'] + block_location['width'] + 2,
-                     block_location['top'] + block_location['height'] + 2),
-                    (255, 0, 0), -1)
-                alpha = 0.2
-                image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+# text_blocks = []
+# non_text_blocks = []
+# sorted_blocks = sorted(page['data'],
+#                        key=lambda block: block['location']['width'] *
+#                        block['location']['height'],
+#                        reverse=True)
+# for block in sorted_blocks:
+#     block_num = block['num']
+#     block_location = block['location']
+#     if any([
+#             is_covered(block_location, non_text_block['location'])
+#             for non_text_block in non_text_blocks
+#     ]):
+#         continue
 
-            continue
+#     block_proportion = block_location['height'] / block_location['width']
+#     if not (block_proportion_threshold[0] < block_proportion <
+#             block_proportion_threshold[1]):
+#         if args.debug:
+#             print(f'Ignore block with proportion {block_proportion}')
+#             overlay = image.copy()
+#             cv2.rectangle(
+#                 overlay,
+#                 (block_location['left'] - 2, block_location['top'] - 2),
+#                 (block_location['left'] + block_location['width'] + 2,
+#                  block_location['top'] + block_location['height'] + 2),
+#                 (255, 0, 0), -1)
+#             alpha = 0.2
+#             image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
 
-        block_area = block_location['width'] * block_location['height']
-        block_word_area = 0
-        for par in block['data']:
-            for line in par['data']:
-                for word in line['data']:
-                    word_location = word['location']
-                    if normal_word_height_limit[0] < word_location[
-                            'height'] < normal_word_height_limit[1]:
-                        if args.debug:
-                            cv2.rectangle(
-                                image,
-                                (word_location['left'], word_location['top']),
-                                (word_location['left'] +
-                                 word_location['width'], word_location['top'] +
-                                 word_location['height']), (0, 0, 0), 2)
-                        block_word_area += word_location[
-                            'width'] * word_location['height']
-        if args.debug:
-            cv2.putText(
-                image, f'B:{block_num},D:{(block_word_area/block_area):.2f}',
-                (block_location['left'] - 300, block_location['top'] + 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 2, cv2.LINE_AA)
+#         continue
 
-        def is_text_block():
-            return (block_word_area / block_area) > 0.4
+#     block_area = block_location['width'] * block_location['height']
+#     block_word_area = 0
+#     for par in block['data']:
+#         for line in par['data']:
+#             for word in line['data']:
+#                 word_location = word['location']
+#                 if normal_word_height_limit[0] < word_location[
+#                         'height'] < normal_word_height_limit[1]:
+#                     if args.debug:
+#                         cv2.rectangle(
+#                             image,
+#                             (word_location['left'], word_location['top']),
+#                             (word_location['left'] +
+#                              word_location['width'], word_location['top'] +
+#                              word_location['height']), (0, 0, 0), 2)
+#                     block_word_area += word_location[
+#                         'width'] * word_location['height']
+#     if args.debug:
+#         cv2.putText(
+#             image, f'B:{block_num},D:{(block_word_area/block_area):.2f}',
+#             (block_location['left'] - 300, block_location['top'] + 50),
+#             cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 2, cv2.LINE_AA)
 
-        if args.debug:
-            overlay = image.copy()
-            cv2.rectangle(
-                overlay,
-                (block_location['left'] - 2, block_location['top'] - 2),
-                (block_location['left'] + block_location['width'] + 2,
-                 block_location['top'] + block_location['height'] + 2),
-                (0, 255, 0) if is_text_block() else (0, 0, 255), -1)
-            alpha = 0.1
-            image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+#     def is_text_block():
+#         return (block_word_area / block_area) > 0.4
 
-        if is_text_block():
-            words = {}
-            for par in block['data']:
-                for line in par['data']:
-                    top_line = min(
-                        [word['location']['top'] for word in line['data']])
-                    bottom_line = max([
-                        word['location']['top'] + word['location']['height']
-                        for word in line['data']
-                    ])
-                    for word in line['data']:
-                        word['location']['top'] = top_line
-                        word['location']['height'] = bottom_line - top_line
-                        words[par['num'], line['num'],
-                              word['num']] = (word['location'], word['data'])
-            words = dict(sorted(words.items())).values()
-            words = [{
-                'location': x[0],
-                'text': x[1]
-            } for x in words if len(x[1].strip()) > 0]
-            text_blocks.append({
-                **{k: block[k]
-                   for k in ['num', 'location']},
-                'data': words,
-                'is_text_block': True,
-            })
-        else:
-            non_text_blocks.append({
-                **{k: block[k]
-                   for k in ['num', 'location']},
-                'is_text_block': False,
-            })
+#     if args.debug:
+#         overlay = image.copy()
+#         cv2.rectangle(
+#             overlay,
+#             (block_location['left'] - 2, block_location['top'] - 2),
+#             (block_location['left'] + block_location['width'] + 2,
+#              block_location['top'] + block_location['height'] + 2),
+#             (0, 255, 0) if is_text_block() else (0, 0, 255), -1)
+#         alpha = 0.1
+#         image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
 
-    if args.debug:
-        stage_dir = os.path.join(temp_dir, 'stage-2')
-        Path(stage_dir).mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(os.path.join(stage_dir, f"page-{index:04d}.png"), image)
+#     if is_text_block():
+#         words = {}
+#         for par in block['data']:
+#             for line in par['data']:
+#                 top_line = min(
+#                     [word['location']['top'] for word in line['data']])
+#                 bottom_line = max([
+#                     word['location']['top'] + word['location']['height']
+#                     for word in line['data']
+#                 ])
+#                 for word in line['data']:
+#                     word['location']['top'] = top_line
+#                     word['location']['height'] = bottom_line - top_line
+#                     words[par['num'], line['num'],
+#                           word['num']] = (word['location'], word['data'])
+#         words = dict(sorted(words.items())).values()
+#         words = [{
+#             'location': x[0],
+#             'text': x[1]
+#         } for x in words if len(x[1].strip()) > 0]
+#         text_blocks.append({
+#             **{k: block[k]
+#                for k in ['num', 'location']},
+#             'data': words,
+#             'is_text_block': True,
+#         })
+#     else:
+#         non_text_blocks.append({
+#             **{k: block[k]
+#                for k in ['num', 'location']},
+#             'is_text_block': False,
+#         })
 
-    page_data = sorted([*text_blocks, *non_text_blocks],
-                       key=lambda x: x['num'])
-    for block in page_data:
-        block['page_index'] = index
-        del block['num']
-    document_data.extend(page_data)
+# if args.debug:
+#     stage_dir = os.path.join(temp_dir, 'stage-2')
+#     Path(stage_dir).mkdir(parents=True, exist_ok=True)
+#     cv2.imwrite(os.path.join(stage_dir, f"page-{index:04d}.png"), image)
+
+# page_data = sorted([*text_blocks, *non_text_blocks],
+#                    key=lambda x: x['num'])
+# for block in page_data:
+#     block['page_index'] = index
+#     del block['num']
+# document_data.extend(page_data)
 
 paper2size_mm = {
     'a4': (210, 297),
