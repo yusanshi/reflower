@@ -12,172 +12,157 @@ from distutils.util import strtobool
 from itertools import chain
 from typesetter import Typesetter
 import layoutparser as lp
+import functools
+import operator
+import itertools
+import ipdb
 
 
 def md5_string(string):
     return hashlib.md5(string.encode('utf-8')).hexdigest()
 
 
-def is_covered(child, parent):
-    bool1 = child['left'] >= parent['left']
-    bool2 = child['top'] >= parent['top']
-    bool3 = child['left'] + child['width'] <= parent['left'] + parent['width']
-    bool4 = child['top'] + child['height'] <= parent['top'] + parent['height']
-    return bool1 and bool2 and bool3 and bool4
-
-
-def convert_tesseract_data(data):
-    length = len(data['level'])
-    level2key = {
-        i + 1: key
-        for i, key in enumerate(
-            ['page_num', 'block_num', 'par_num', 'line_num', 'word_num'])
-    }
-
-    def get_data(candidate_indexs,
-                 level=None,
-                 page_num=None,
-                 block_num=None,
-                 par_num=None,
-                 line_num=None,
-                 word_num=None):
-        result = []
-        found_indexs = []
-        for i in candidate_indexs:
-            if level is not None and data['level'][i] != level:
-                continue
-            if page_num is not None and data['page_num'][i] != page_num:
-                continue
-            if block_num is not None and data['block_num'][i] != block_num:
-                continue
-            if par_num is not None and data['par_num'][i] != par_num:
-                continue
-            if line_num is not None and data['line_num'][i] != line_num:
-                continue
-            if word_num is not None and data['word_num'][i] != word_num:
-                continue
-            found_indexs.append(i)
-        for index in found_indexs:
-            if level < 5:
-                result_data = get_data(
-                    list(set(candidate_indexs) - set(found_indexs)),
-                    level=level + 1,
-                    **{
-                        level2key[x]: data[level2key[x]][index]
-                        for x in range(1, level + 1)
-                    })
-            else:
-                result_data = data['text'][index]
-
-            result.append({
-                'level': level,
-                'num': data[level2key[level]][index],
-                'location': {
-                    'left': data['left'][index],
-                    'top': data['top'][index],
-                    'width': data['width'][index],
-                    'height': data['height'][index],
-                },
-                'data': result_data
-            })
-        return result
-
-    result = get_data(level=1, candidate_indexs=range(length))
-    return result
-
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=str, default='./test/example.pdf')
 parser.add_argument('--target', type=str, default='./output.pdf')
-parser.add_argument('--dpi', type=int, default=400)
+parser.add_argument('--detection_dpi', type=int, default=144)
+parser.add_argument('--export_dpi', type=int, default=300)
 parser.add_argument('--target_paper', type=str, default='pw3')
+parser.add_argument('--detector',
+                    type=str,
+                    nargs='+',
+                    default=['general', 'table', 'formula'],
+                    choices=['general', 'table', 'formula'])
+parser.add_argument('--threshold',
+                    type=str,
+                    nargs='+',
+                    default=['general:0.0', 'table:0.8', 'formula:0.8'])
 parser.add_argument('--debug',
                     type=lambda x: bool(strtobool(x)),
                     default=False)
 parser.add_argument('--root_temp_dir', type=str, default='./temp')
 args = parser.parse_args()
 
+threshold = {k.split(':')[0]: float(k.split(':')[1]) for k in args.threshold}
+for k, v in threshold.items():
+    assert k in args.detector, f'{k} is not in {args.detector}'
+    assert 0 <= v <= 1, f'{v} is not in [0, 1]'
+
 assert os.path.isfile(args.source), 'Source file not found'
-source_page_data_pillow = convert_from_path(args.source, dpi=args.dpi)
+source_page_data_pillow = convert_from_path(args.source,
+                                            dpi=args.detection_dpi)
 source_page_data_opencv = [
     cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR)
     for page in source_page_data_pillow
 ]
+
+detector = {}
+if 'general' in args.detector:
+    detector['general'] = lp.PaddleDetectionLayoutModel(
+        "lp://paddledetection/PubLayNet/ppyolov2_r50vd_dcn_365e",
+        label_map={
+            0: "Text",
+            1: "Title",
+            2: "List",
+            3: "Table",
+            4: "Figure"
+        })
+if 'table' in args.detector:
+    detector['table'] = lp.PaddleDetectionLayoutModel(
+        'lp://paddledetection/TableBank/ppyolov2_r50vd_dcn_365e',
+        label_map={0: "Table"})
+if 'formula' in args.detector:
+    detector['formula'] = lp.Detectron2LayoutModel(
+        'lp://MFD/faster_rcnn_R_50_FPN_3x/config', label_map={1: "Equation"})
+
 if args.debug:
     hash_value = md5_string(str(args))[:16]
     temp_dir = os.path.join(args.root_temp_dir, hash_value)
     print(f'Temp directory: {temp_dir}')
-    stage_dir = os.path.join(temp_dir, 'stage-1')
-    Path(stage_dir).mkdir(parents=True, exist_ok=True)
-    for index, page in enumerate(source_page_data_opencv):
-        image_path = os.path.join(stage_dir, f"page-{index:04d}.png")
-        cv2.imwrite(image_path, page)
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
 
-color_map = {
-    'text': 'red',
-    'title': 'blue',
-    'list': 'green',
-    'table': 'purple',
-    'figure': 'pink',
-}
+text_block = {'Text', 'Title', 'List'}
+non_text_block = {'Table', 'Figure', 'Equation'}
 
-# lp_model = lp.EfficientDetLayoutModel(
-#     "lp://efficientdet/PubLayNet/tf_efficientdet_d1")
-
-lp_model_general = lp.PaddleDetectionLayoutModel(
-    "lp://paddledetection/PubLayNet/ppyolov2_r50vd_dcn_365e")
-# lp_model = lp.Detectron2LayoutModel(
-#     # 'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
-#     'lp://PubLayNet/mask_rcnn_X_101_32x8d_FPN_3x/config')
-
-lp_model_table = lp.PaddleDetectionLayoutModel(
-    'lp://paddledetection/TableBank/ppyolov2_r50vd_dcn_365e')
-
-# formula
-lp_model_formula = lp.Detectron2LayoutModel(
-    'lp://MFD/faster_rcnn_R_50_FPN_3x/config')
-
-# table
-# lp_model = lp.Detectron2LayoutModel(
-#     config_path=
-#     'lp://TableBank/faster_rcnn_R_101_FPN_3x/config',  # In model catalog
-#     label_map={0: "Table"},  # In model`label_map`
-# )
-
-block_proportion_threshold = (1 / 50, 8)
 document_data = []
-for index in range(len(source_page_data_opencv)):
-    if args.debug:
-        image = source_page_data_opencv[index].copy()
-    layout_formula = lp_model_formula.detect(source_page_data_pillow[index])
-    for x in layout_formula:
-        print('Formula:', x.score)
-    layout_table = lp_model_table.detect(source_page_data_pillow[index])
-    for x in layout_table:
-        print('Table:', x.score)
-    layout_general = lp_model_general.detect(source_page_data_pillow[index])
-    for x in layout_general:
-        print('General:', x.score)
-    print()
-    # If overlapped, then 1. keep the largest, or 2. ((min(x1), max(y1)), (max(x2),max(y2)))
-    # then reorder
-    # then for text block, for non-text block...
-    # TODO enlarge the block space if the border area is not occpuied by other blocks
-    # TODO pdf text to outlines, then copy the vector into new pdf instead of bitmap
-    lp.draw_box(
-        source_page_data_pillow[index],
-        # layout,
-        [
-            b for b in layout_general + layout_formula + layout_table
-            if b.score > 0.4
-        ],
-        show_element_id=True,
-        color_map=color_map,
-        id_font_size=40,
-        id_text_background_color='grey',
-        id_text_color='white',
-        box_width=3).show()
+for index, image in enumerate(source_page_data_pillow):
+    image_temp = image.copy()
 
+    layout = {}
+    bg_color = max(image_temp.getcolors(image_temp.width *
+                                        image_temp.height))[1]
+    for x in set(args.detector) & set(['table', 'formula']):
+        layout[x] = lp.Layout([
+            e for e in detector[x].detect(image_temp)
+            if e.score >= threshold[x]
+        ])
+        for block in layout[x]:
+            image_temp.paste(bg_color, tuple(map(int, block.coordinates)))
+
+    for x in set(args.detector) & set(['general']):
+        layout[x] = lp.Layout([
+            e for e in detector[x].detect(image_temp)
+            if e.score >= threshold[x]
+        ])
+
+    blocks = functools.reduce(operator.add, layout.values())
+
+    while True:
+        for first, second in itertools.combinations(range(len(blocks)), 2):
+            intersected = blocks[first].intersect(blocks[second])
+            if intersected.width > 0 and intersected.height > 0 and (
+                    intersected.area /
+                    min(blocks[first].area, blocks[second].area)) > 0.6:
+                # inherit the more confident one's properties
+                if blocks[first].score >= blocks[second].score:
+                    unioned = blocks[first].union(blocks[second])
+                else:
+                    unioned = blocks[second].union(blocks[first])
+                # the deleting order matters...
+                del blocks[second]
+                del blocks[first]
+                blocks.append(unioned)
+                break  # continue on `while True`
+        else:
+            break  # break the whole `while True`
+
+    left_interval = lp.Interval(0, image.width / 2 * 1.1,
+                                axis='x').put_on_canvas(image)
+    left_blocks = blocks.filter_by(left_interval, center=True)
+    left_blocks.sort(key=lambda b: b.coordinates[1], inplace=True)
+
+    right_blocks = lp.Layout([b for b in blocks if b not in left_blocks])
+    right_blocks.sort(key=lambda b: b.coordinates[1], inplace=True)
+
+    blocks = lp.Layout(
+        [b.set(id=idx) for idx, b in enumerate(left_blocks + right_blocks)])
+
+    # TODO see https://layout-parser.readthedocs.io/en/latest/notes/shape_operations.html
+    # TODO see https://layout-parser.readthedocs.io/en/latest/example/deep_layout_parsing/index.html#fetch-the-text-inside-each-text-region
+    # TODO see https://layout-parser.readthedocs.io/en/latest/api_doc/ocr.html
+    # TODO see https://layout-parser.readthedocs.io/en/latest/example/parse_ocr/index.html
+    # then for text block, for non-text block...
+    # TODO enlarge the block space if the border area is not occpuied by other blocks (enlarge by a step)
+    # TODO pdf text to outlines, then copy the vector into new pdf instead of bitmap
+
+    if args.debug:
+        boxed_image = lp.draw_box(
+            image,
+            lp.Layout(
+                [b.set(id=f'{b.id}/{b.type}/{b.score:.2f}') for b in blocks]),
+            show_element_id=True,
+            id_font_size=20,
+            color_map={
+                **{k: 'green'
+                   for k in text_block},
+                **{k: 'red'
+                   for k in non_text_block}
+            },
+            id_text_background_color='grey',
+            id_text_color='white',
+            box_width=4)
+        boxed_image.save(os.path.join(temp_dir, f"page-{index:04d}-box.png"))
+    # ipdb.set_trace()
 exit(0)
 # data = pytesseract.image_to_data(source_page_data_pillow[index],
 #                                  output_type=Output.DICT)
@@ -206,23 +191,6 @@ exit(0)
 #             is_covered(block_location, non_text_block['location'])
 #             for non_text_block in non_text_blocks
 #     ]):
-#         continue
-
-#     block_proportion = block_location['height'] / block_location['width']
-#     if not (block_proportion_threshold[0] < block_proportion <
-#             block_proportion_threshold[1]):
-#         if args.debug:
-#             print(f'Ignore block with proportion {block_proportion}')
-#             overlay = image.copy()
-#             cv2.rectangle(
-#                 overlay,
-#                 (block_location['left'] - 2, block_location['top'] - 2),
-#                 (block_location['left'] + block_location['width'] + 2,
-#                  block_location['top'] + block_location['height'] + 2),
-#                 (255, 0, 0), -1)
-#             alpha = 0.2
-#             image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
-
 #         continue
 
 #     block_area = block_location['width'] * block_location['height']
@@ -294,11 +262,6 @@ exit(0)
 #                for k in ['num', 'location']},
 #             'is_text_block': False,
 #         })
-
-# if args.debug:
-#     stage_dir = os.path.join(temp_dir, 'stage-2')
-#     Path(stage_dir).mkdir(parents=True, exist_ok=True)
-#     cv2.imwrite(os.path.join(stage_dir, f"page-{index:04d}.png"), image)
 
 # page_data = sorted([*text_blocks, *non_text_blocks],
 #                    key=lambda x: x['num'])
