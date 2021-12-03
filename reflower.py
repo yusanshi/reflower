@@ -17,10 +17,20 @@ import operator
 import itertools
 import ipdb
 
+import warnings
+warnings.filterwarnings("ignore")
+
 
 def md5_string(string):
     return hashlib.md5(string.encode('utf-8')).hexdigest()
 
+
+def is_postive_area(area):
+    return area.width > 0 and area.height > 0
+
+
+LEFT_INTERVAL_COEFFICIENT = 1.1
+EXPANDING_STEP = 0.05  # inch
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=str, default='./test/example.pdf')
@@ -85,7 +95,7 @@ text_block = {'Text', 'Title', 'List'}
 non_text_block = {'Table', 'Figure', 'Equation'}
 
 document_data = []
-for index, image in enumerate(source_page_data_pillow):
+for page_index, image in enumerate(source_page_data_pillow):
     image_temp = image.copy()
 
     layout = {}
@@ -107,12 +117,12 @@ for index, image in enumerate(source_page_data_pillow):
 
     blocks = functools.reduce(operator.add, layout.values())
 
+    # Combine overlapped blocks
     while True:
         for first, second in itertools.combinations(range(len(blocks)), 2):
             intersected = blocks[first].intersect(blocks[second])
-            if intersected.width > 0 and intersected.height > 0 and (
-                    intersected.area /
-                    min(blocks[first].area, blocks[second].area)) > 0.6:
+            if is_postive_area(intersected) and (intersected.area / min(
+                    blocks[first].area, blocks[second].area)) > 0.6:
                 # inherit the more confident one's properties
                 if blocks[first].score >= blocks[second].score:
                     unioned = blocks[first].union(blocks[second])
@@ -126,7 +136,9 @@ for index, image in enumerate(source_page_data_pillow):
         else:
             break  # break the whole `while True`
 
-    left_interval = lp.Interval(0, image.width / 2 * 1.1,
+    # Assign the orders
+    left_interval = lp.Interval(0,
+                                image.width / 2 * LEFT_INTERVAL_COEFFICIENT,
                                 axis='x').put_on_canvas(image)
     left_blocks = blocks.filter_by(left_interval, center=True)
     left_blocks.sort(key=lambda b: b.coordinates[1], inplace=True)
@@ -137,12 +149,59 @@ for index, image in enumerate(source_page_data_pillow):
     blocks = lp.Layout(
         [b.set(id=idx) for idx, b in enumerate(left_blocks + right_blocks)])
 
+    # Expanding the blocks
+    expanding_step = int(EXPANDING_STEP * args.detection_dpi)
+    for block_index in range(len(blocks)):
+        while True:
+            for direction_index, direction in enumerate(
+                ['left', 'top', 'right', 'bottom']):
+                base_coordinates = blocks[block_index].coordinates
+                padded = blocks[block_index].pad(**{direction: expanding_step})
+                padded_coordinates = padded.coordinates
+
+                # Get (blocks[block_index] XOR padded) coordinates
+                # or "padded - blocks[block_index]" coordinates
+                not_equal = [
+                    (x, y)
+                    for x, y in zip(base_coordinates, padded_coordinates)
+                    if x != y
+                ]
+                assert len(not_equal) == 1
+                border_coordinates = list(padded_coordinates)
+                border_coordinates[direction_index] = not_equal[0][1]
+                border_coordinates[(direction_index + 2) % 4] = not_equal[0][0]
+                border_coordinates = tuple(border_coordinates)
+
+                # if will overlap with other blocks, stop expanding
+                if any([
+                        is_postive_area(blocks[j].intersect(
+                            lp.Rectangle(*border_coordinates)))
+                        for j in range(len(blocks)) if j != block_index
+                ]):
+                    continue
+
+                border = image.crop(border_coordinates)
+                border_colors = border.getcolors(border.width * border.height)
+                # if the expanding area is **blank**, stop expanding
+                if len(border_colors) == 1 and border_colors[0][1] == bg_color:
+                    continue
+
+                blocks[block_index] = padded
+                if args.debug:
+                    print(
+                        f'In page {page_index} padding block {block_index} on {direction}'
+                    )
+
+                break  # continue on `while True`
+
+            else:
+                break  # break the whole `while True`
+
     # TODO see https://layout-parser.readthedocs.io/en/latest/notes/shape_operations.html
     # TODO see https://layout-parser.readthedocs.io/en/latest/example/deep_layout_parsing/index.html#fetch-the-text-inside-each-text-region
     # TODO see https://layout-parser.readthedocs.io/en/latest/api_doc/ocr.html
     # TODO see https://layout-parser.readthedocs.io/en/latest/example/parse_ocr/index.html
     # then for text block, for non-text block...
-    # TODO enlarge the block space if the border area is not occpuied by other blocks (enlarge by a step)
     # TODO pdf text to outlines, then copy the vector into new pdf instead of bitmap
 
     if args.debug:
@@ -151,7 +210,7 @@ for index, image in enumerate(source_page_data_pillow):
             lp.Layout(
                 [b.set(id=f'{b.id}/{b.type}/{b.score:.2f}') for b in blocks]),
             show_element_id=True,
-            id_font_size=20,
+            id_font_size=15,
             color_map={
                 **{k: 'green'
                    for k in text_block},
@@ -160,8 +219,9 @@ for index, image in enumerate(source_page_data_pillow):
             },
             id_text_background_color='grey',
             id_text_color='white',
-            box_width=4)
-        boxed_image.save(os.path.join(temp_dir, f"page-{index:04d}-box.png"))
+            box_width=2)
+        boxed_image.save(
+            os.path.join(temp_dir, f"page-{page_index:04d}-box.png"))
     # ipdb.set_trace()
 exit(0)
 # data = pytesseract.image_to_data(source_page_data_pillow[index],
