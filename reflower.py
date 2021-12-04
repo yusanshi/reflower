@@ -29,6 +29,70 @@ def is_postive_area(area):
     return area.width > 0 and area.height > 0
 
 
+def map_location(location, from_dpi, to_dpi):
+    return {k: int(v * to_dpi / from_dpi) for k, v in location.items()}
+
+
+def convert_tesseract_data(data):
+    length = len(data['level'])
+    level2key = {
+        i + 1: key
+        for i, key in enumerate(
+            ['page_num', 'block_num', 'par_num', 'line_num', 'word_num'])
+    }
+
+    def get_data(candidate_indexs,
+                 level=None,
+                 page_num=None,
+                 block_num=None,
+                 par_num=None,
+                 line_num=None,
+                 word_num=None):
+        result = []
+        found_indexs = []
+        for i in candidate_indexs:
+            if level is not None and data['level'][i] != level:
+                continue
+            if page_num is not None and data['page_num'][i] != page_num:
+                continue
+            if block_num is not None and data['block_num'][i] != block_num:
+                continue
+            if par_num is not None and data['par_num'][i] != par_num:
+                continue
+            if line_num is not None and data['line_num'][i] != line_num:
+                continue
+            if word_num is not None and data['word_num'][i] != word_num:
+                continue
+            found_indexs.append(i)
+        for index in found_indexs:
+            if level < 5:
+                result_data = get_data(
+                    list(set(candidate_indexs) - set(found_indexs)),
+                    level=level + 1,
+                    **{
+                        level2key[x]: data[level2key[x]][index]
+                        for x in range(1, level + 1)
+                    })
+            else:
+                result_data = data['text'][index]
+
+            result.append({
+                'level': level,
+                'num': data[level2key[level]][index],
+                'location': {
+                    'left': data['left'][index],
+                    'top': data['top'][index],
+                    'width': data['width'][index],
+                    'height': data['height'][index],
+                },
+                'data': result_data
+            })
+        return result
+
+    result = get_data(level=1, candidate_indexs=range(length))
+    return result
+
+
 LEFT_INTERVAL_COEFFICIENT = 1.1
 EXPANDING_STEP = 0.05  # inch
 
@@ -61,10 +125,6 @@ for k, v in threshold.items():
 assert os.path.isfile(args.source), 'Source file not found'
 source_page_data_pillow = convert_from_path(args.source,
                                             dpi=args.detection_dpi)
-source_page_data_opencv = [
-    cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR)
-    for page in source_page_data_pillow
-]
 
 detector = {}
 if 'general' in args.detector:
@@ -150,7 +210,7 @@ for page_index, image in enumerate(source_page_data_pillow):
         [b.set(id=idx) for idx, b in enumerate(left_blocks + right_blocks)])
 
     # Expanding the blocks
-    expanding_step = int(EXPANDING_STEP * args.detection_dpi)
+    expanding_step = EXPANDING_STEP * args.detection_dpi
     for block_index in range(len(blocks)):
         while True:
             for direction_index, direction in enumerate(
@@ -197,16 +257,66 @@ for page_index, image in enumerate(source_page_data_pillow):
             else:
                 break  # break the whole `while True`
 
-    # TODO see https://layout-parser.readthedocs.io/en/latest/notes/shape_operations.html
-    # TODO see https://layout-parser.readthedocs.io/en/latest/example/deep_layout_parsing/index.html#fetch-the-text-inside-each-text-region
-    # TODO see https://layout-parser.readthedocs.io/en/latest/api_doc/ocr.html
-    # TODO see https://layout-parser.readthedocs.io/en/latest/example/parse_ocr/index.html
-    # then for text block, for non-text block...
     # TODO pdf text to outlines, then copy the vector into new pdf instead of bitmap
 
+    # OCR
+    for block in blocks:
+        if block.type in text_block:
+            data = pytesseract.image_to_data(image.crop(block.coordinates),
+                                             output_type=Output.DICT)
+            data = convert_tesseract_data(data)
+            assert len(data) == 1
+            tesseract_page = data[0]
+
+            text = []
+            for tesseract_block in tesseract_page['data']:
+                for tesseract_par in tesseract_block['data']:
+                    for tesseract_line in tesseract_par['data']:
+                        top_line = min([
+                            tesseract_word['location']['top']
+                            for tesseract_word in tesseract_line['data']
+                        ])
+                        bottom_line = max([
+                            tesseract_word['location']['top'] +
+                            tesseract_word['location']['height']
+                            for tesseract_word in tesseract_line['data']
+                        ])
+                        for tesseract_word in tesseract_line['data']:
+                            if len(tesseract_word['data'].strip()) > 0:
+                                text.append({
+                                    'location': {
+                                        'left':
+                                        tesseract_word['location']['left'] +
+                                        block.coordinates[0],
+                                        'top':
+                                        top_line + block.coordinates[1],
+                                        'width':
+                                        tesseract_word['location']['width'],
+                                        'height':
+                                        bottom_line - top_line
+                                    },
+                                    'text': tesseract_word['data']
+                                })
+
+            block.set(text=text, inplace=True)
+
     if args.debug:
+        boxed_image = image.copy()
+        for block in blocks:
+            if block.type in text_block:
+                boxed_image = lp.draw_box(
+                    boxed_image,
+                    lp.Layout([
+                        lp.TextBlock(lp.Rectangle(
+                            x['location']['left'], x['location']['top'],
+                            x['location']['left'] + x['location']['width'],
+                            x['location']['top'] + x['location']['height']),
+                                     type='Word') for x in block.text
+                    ]),
+                    color_map={'Word': 'grey'},
+                    box_width=1)
         boxed_image = lp.draw_box(
-            image,
+            boxed_image,
             lp.Layout(
                 [b.set(id=f'{b.id}/{b.type}/{b.score:.2f}') for b in blocks]),
             show_element_id=True,
@@ -220,30 +330,41 @@ for page_index, image in enumerate(source_page_data_pillow):
             id_text_background_color='grey',
             id_text_color='white',
             box_width=2)
+
         boxed_image.save(
             os.path.join(temp_dir, f"page-{page_index:04d}-box.png"))
-    # ipdb.set_trace()
-exit(0)
-# data = pytesseract.image_to_data(source_page_data_pillow[index],
-#                                  output_type=Output.DICT)
-# word_heights = np.array([
-#     data['height'][i] for i in range(len(data['level']))
-#     if data['level'][i] == 5
-# ])
-# normal_word_height = np.median(word_heights)
-# normal_word_height_limit = (normal_word_height / 3, normal_word_height * 3)
 
-# data = convert_tesseract_data(data)
-# assert len(data) == 1
-# page = data[0]
-# page_location = page['location']
+    for block in blocks:
+        if block.type in text_block:
+            document_data.append({
+                'page_index':
+                page_index,
+                'is_text_block':
+                True,
+                'data': [{
+                    'location':
+                    map_location(x['location'], args.detection_dpi,
+                                 args.export_dpi),
+                    'text':
+                    x['text']
+                } for x in block.text]
+            })
+        else:
+            document_data.append({
+                'location':
+                map_location(
+                    {
+                        'left': block.coordinates[0],
+                        'top': block.coordinates[1],
+                        'width': block.width,
+                        'height': block.height
+                    }, args.detection_dpi, args.export_dpi),
+                'page_index':
+                page_index,
+                'is_text_block':
+                False
+            })
 
-# text_blocks = []
-# non_text_blocks = []
-# sorted_blocks = sorted(page['data'],
-#                        key=lambda block: block['location']['width'] *
-#                        block['location']['height'],
-#                        reverse=True)
 # for block in sorted_blocks:
 #     block_num = block['num']
 #     block_location = block['location']
@@ -340,7 +461,8 @@ if args.target_paper in paper2size_mm:
 else:
     paper_size_mm = list(map(float, args.target_paper.split('x')))
 # (width, height)
-paper_size_pt = tuple(map(lambda x: int(x / 25.4 * args.dpi), paper_size_mm))
+paper_size_pt = tuple(
+    map(lambda x: int(x / 25.4 * args.export_dpi), paper_size_mm))
 
 text_height = int(
     np.median(
@@ -350,17 +472,16 @@ text_height = int(
                     [[x['location']['height'] for x in block['data']]
                      for block in document_data if block['is_text_block']])))))
 
+source_page_data_opencv = [
+    cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR)
+    for page in convert_from_path(args.source, dpi=args.export_dpi)
+]
 typesetter = Typesetter(*paper_size_pt, text_height, source_page_data_opencv)
 
 for block in document_data:
     typesetter.add_block(block)
 
 exported_pages_opencv = typesetter.export_pages()
-if args.debug:
-    stage_dir = os.path.join(temp_dir, 'stage-3')
-    Path(stage_dir).mkdir(parents=True, exist_ok=True)
-    for index, page in enumerate(exported_pages_opencv):
-        cv2.imwrite(os.path.join(stage_dir, f"page-{index:04d}.png"), page)
 
 exported_pages_pillow = [
     Image.fromarray(cv2.cvtColor(page, cv2.COLOR_BGR2RGB))
@@ -368,6 +489,6 @@ exported_pages_pillow = [
 ]
 exported_pages_pillow[0].save(args.target,
                               "PDF",
-                              resolution=args.dpi,
+                              resolution=args.export_dpi,
                               save_all=True,
                               append_images=exported_pages_pillow[1:])
