@@ -7,9 +7,9 @@ class Typesetter:
         self.page_width = page_width
         self.page_height = page_height
         self.text_height = text_height
-        self.line_height = int(1.5 * text_height)
+        self.line_height = int(1.3 * text_height)
         self.word_space = int(0.4 * text_height)
-        self.dash_space = int(0.25 * text_height)
+        self.dash_space = int(0.3 * text_height)
         self.last_word_height = text_height
         self.source_page_data = source_page_data
         self.pages = []
@@ -32,9 +32,7 @@ class Typesetter:
         for word in block['data']:
             new_size = (word['location']['width'], word['location']['height'])
             while True:
-                if self.is_fittable(new_size) and (
-                        abs(self.last_word_height - new_size[1]) /
-                        self.text_height) < 0.005:
+                if self.is_fittable(new_size):
                     break
                 self.take_new_line(new_size[1])
                 if self.is_fittable(new_size):
@@ -60,6 +58,8 @@ class Typesetter:
                 word_space = self.word_space
             self.current_curser[0] += new_size[0] + word_space
             self.last_word_height = new_size[1]
+
+        self.take_new_line(1.5 * self.text_height)
 
     def add_non_text_block(self, block):
         if self.current_curser[0] != self.available_area[0][0]:
@@ -102,6 +102,7 @@ class Typesetter:
                           self.current_curser[0]:self.current_curser[0] +
                           new_size[0]] = source
         self.current_curser[1] += new_size[1]
+        self.take_new_line(0.5 * self.text_height)
 
     def is_fittable(self, new_size):
         return self.current_curser[0] + new_size[0] <= self.available_area[1][
@@ -119,8 +120,8 @@ class Typesetter:
         if current_word_height is None:
             coefficient = self.last_word_height / self.text_height
         else:
-            coefficient = max(current_word_height,
-                              self.last_word_height) / self.text_height
+            coefficient = np.mean((current_word_height,
+                                   self.last_word_height)) / self.text_height
         line_height = int(self.line_height * coefficient)
         if self.current_curser[1] + line_height > self.available_area[1][1]:
             self.take_new_page()

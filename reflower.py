@@ -1,23 +1,24 @@
 import argparse
 import os
-from pathlib import Path
 import pytesseract
-from pytesseract import Output
 import cv2
 import hashlib
-from pdf2image import convert_from_path
-from PIL import Image
 import numpy as np
-from distutils.util import strtobool
-from itertools import chain
-from typesetter import Typesetter
 import layoutparser as lp
 import functools
 import operator
 import itertools
-import ipdb
-
 import warnings
+import ocrmypdf
+
+from pathlib import Path
+from pytesseract import Output
+from pdf2image import convert_from_path
+from PIL import Image
+from distutils.util import strtobool
+from itertools import chain
+from typesetter import Typesetter
+
 warnings.filterwarnings("ignore")
 
 
@@ -95,11 +96,12 @@ def convert_tesseract_data(data):
 
 LEFT_INTERVAL_COEFFICIENT = 1.1
 EXPANDING_STEP = 0.05  # inch
+WORD_BORDER_EXPANDED = 0.01  # inch
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=str, default='./test/example.pdf')
 parser.add_argument('--target', type=str, default='./output.pdf')
-parser.add_argument('--detection_dpi', type=int, default=144)
+parser.add_argument('--detection_dpi', type=int, default=200)
 parser.add_argument('--export_dpi', type=int, default=300)
 parser.add_argument('--target_paper', type=str, default='pw3')
 parser.add_argument('--detector',
@@ -263,6 +265,7 @@ for page_index, image in enumerate(source_page_data_pillow):
     for block in blocks:
         if block.type in text_block:
             data = pytesseract.image_to_data(image.crop(block.coordinates),
+                                             lang='eng',
                                              output_type=Output.DICT)
             data = convert_tesseract_data(data)
             assert len(data) == 1
@@ -272,28 +275,25 @@ for page_index, image in enumerate(source_page_data_pillow):
             for tesseract_block in tesseract_page['data']:
                 for tesseract_par in tesseract_block['data']:
                     for tesseract_line in tesseract_par['data']:
-                        top_line = min([
-                            tesseract_word['location']['top']
-                            for tesseract_word in tesseract_line['data']
-                        ])
-                        bottom_line = max([
-                            tesseract_word['location']['top'] +
-                            tesseract_word['location']['height']
-                            for tesseract_word in tesseract_line['data']
-                        ])
+                        line_top = tesseract_line['location']['top']
+                        line_height = tesseract_line['location']['height']
                         for tesseract_word in tesseract_line['data']:
                             if len(tesseract_word['data'].strip()) > 0:
+                                word_border_expanded = WORD_BORDER_EXPANDED * args.detection_dpi
                                 text.append({
                                     'location': {
                                         'left':
                                         tesseract_word['location']['left'] +
-                                        block.coordinates[0],
+                                        block.coordinates[0] -
+                                        word_border_expanded,
                                         'top':
-                                        top_line + block.coordinates[1],
+                                        line_top + block.coordinates[1] -
+                                        word_border_expanded,
                                         'width':
-                                        tesseract_word['location']['width'],
+                                        tesseract_word['location']['width'] +
+                                        2 * word_border_expanded,
                                         'height':
-                                        bottom_line - top_line
+                                        line_height + 2 * word_border_expanded
                                     },
                                     'text': tesseract_word['data']
                                 })
@@ -320,7 +320,7 @@ for page_index, image in enumerate(source_page_data_pillow):
             lp.Layout(
                 [b.set(id=f'{b.id}/{b.type}/{b.score:.2f}') for b in blocks]),
             show_element_id=True,
-            id_font_size=15,
+            id_font_size=20,
             color_map={
                 **{k: 'green'
                    for k in text_block},
@@ -365,92 +365,6 @@ for page_index, image in enumerate(source_page_data_pillow):
                 False
             })
 
-# for block in sorted_blocks:
-#     block_num = block['num']
-#     block_location = block['location']
-#     if any([
-#             is_covered(block_location, non_text_block['location'])
-#             for non_text_block in non_text_blocks
-#     ]):
-#         continue
-
-#     block_area = block_location['width'] * block_location['height']
-#     block_word_area = 0
-#     for par in block['data']:
-#         for line in par['data']:
-#             for word in line['data']:
-#                 word_location = word['location']
-#                 if normal_word_height_limit[0] < word_location[
-#                         'height'] < normal_word_height_limit[1]:
-#                     if args.debug:
-#                         cv2.rectangle(
-#                             image,
-#                             (word_location['left'], word_location['top']),
-#                             (word_location['left'] +
-#                              word_location['width'], word_location['top'] +
-#                              word_location['height']), (0, 0, 0), 2)
-#                     block_word_area += word_location[
-#                         'width'] * word_location['height']
-#     if args.debug:
-#         cv2.putText(
-#             image, f'B:{block_num},D:{(block_word_area/block_area):.2f}',
-#             (block_location['left'] - 300, block_location['top'] + 50),
-#             cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 0, 0), 2, cv2.LINE_AA)
-
-#     def is_text_block():
-#         return (block_word_area / block_area) > 0.4
-
-#     if args.debug:
-#         overlay = image.copy()
-#         cv2.rectangle(
-#             overlay,
-#             (block_location['left'] - 2, block_location['top'] - 2),
-#             (block_location['left'] + block_location['width'] + 2,
-#              block_location['top'] + block_location['height'] + 2),
-#             (0, 255, 0) if is_text_block() else (0, 0, 255), -1)
-#         alpha = 0.1
-#         image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
-
-#     if is_text_block():
-#         words = {}
-#         for par in block['data']:
-#             for line in par['data']:
-#                 top_line = min(
-#                     [word['location']['top'] for word in line['data']])
-#                 bottom_line = max([
-#                     word['location']['top'] + word['location']['height']
-#                     for word in line['data']
-#                 ])
-#                 for word in line['data']:
-#                     word['location']['top'] = top_line
-#                     word['location']['height'] = bottom_line - top_line
-#                     words[par['num'], line['num'],
-#                           word['num']] = (word['location'], word['data'])
-#         words = dict(sorted(words.items())).values()
-#         words = [{
-#             'location': x[0],
-#             'text': x[1]
-#         } for x in words if len(x[1].strip()) > 0]
-#         text_blocks.append({
-#             **{k: block[k]
-#                for k in ['num', 'location']},
-#             'data': words,
-#             'is_text_block': True,
-#         })
-#     else:
-#         non_text_blocks.append({
-#             **{k: block[k]
-#                for k in ['num', 'location']},
-#             'is_text_block': False,
-#         })
-
-# page_data = sorted([*text_blocks, *non_text_blocks],
-#                    key=lambda x: x['num'])
-# for block in page_data:
-#     block['page_index'] = index
-#     del block['num']
-# document_data.extend(page_data)
-
 paper2size_mm = {
     'a4': (210, 297),
     'a5': (148, 210),
@@ -492,3 +406,10 @@ exported_pages_pillow[0].save(args.target,
                               resolution=args.export_dpi,
                               save_all=True,
                               append_images=exported_pages_pillow[1:])
+
+ocrmypdf.ocr(args.target,
+             args.target,
+             output_type='pdf',
+             language=['eng'],
+             optimize=0,
+             jobs=4)
