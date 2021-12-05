@@ -54,8 +54,8 @@ def convert_tesseract_data(data):
 
     for page in data:
         for block in page['data']:
-            for par in block['data]:
-                for line in block['data']:
+            for par in block['data']:
+                for line in par['data']:
                     for word in line['data']:
                         pass
     '''
