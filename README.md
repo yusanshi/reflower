@@ -14,9 +14,8 @@ Reflow a PDF file for e-readers like Kindle.
 
 ### Preparations
 - Install tesseract-related packages: install [tesseract-ocr](https://github.com/tesseract-ocr/tesseract) (I use Tesseract 5 and [tessdata_best models](https://github.com/tesseract-ocr/tessdata_best/blob/main/eng.traineddata)) and pytesseract (`pip install pytesseract`)
-- Install layout-parser: `pip install "layoutparser[layoutmodels]"`
-- Install OpenCV-Python
-- Other packages: `pip install Pillow pdf2image numpy`
+- Install layout-parser along with dependency packages: `pip install layoutparser`, [install detectron2](https://detectron2.readthedocs.io/en/latest/tutorials/install.html), [install paddledetection](https://github.com/PaddlePaddle/PaddleDetection/blob/release/2.3/docs/tutorials/INSTALL.md)
+- Install other smaller packages: `pip install opencv-python Pillow pdf2image numpy`
 
 ### Run
 
